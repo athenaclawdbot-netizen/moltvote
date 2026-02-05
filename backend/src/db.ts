@@ -1,10 +1,16 @@
 import Database from 'better-sqlite3';
 import path from 'path';
+import fs from 'fs';
 
-// 生產環境用 /data（Render persistent disk），本地用 ./data
-const dbPath = process.env.NODE_ENV === 'production' 
-  ? '/data/moltvote.db'
-  : path.join(__dirname, '..', 'data', 'moltvote.db');
+// 使用相對路徑（Free 方案沒有 Persistent Disk）
+const dataDir = path.join(__dirname, '..', 'data');
+const dbPath = path.join(dataDir, 'moltvote.db');
+
+// 確保目錄存在
+if (!fs.existsSync(dataDir)) {
+  fs.mkdirSync(dataDir, { recursive: true });
+}
+
 const db = new Database(dbPath);
 
 // 建立表格
