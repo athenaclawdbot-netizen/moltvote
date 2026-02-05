@@ -41,6 +41,34 @@ body {
 
 /* RainbowKit customization */
 [data-rk] {
-  --rk-colors-accentColor: #dc2626;
+  --rk-colors-accentColor: #2563eb;
   --rk-colors-accentColorForeground: #fff;
+}
+
+/* 彈幕動畫 */
+@keyframes marquee {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(-50%);
+  }
+}
+
+.animate-marquee {
+  animation: marquee 30s linear infinite;
+}
+
+.animate-marquee:hover {
+  animation-play-state: paused;
+}
+
+/* 隱藏滾動條 */
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
 }

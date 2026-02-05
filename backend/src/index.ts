@@ -1,249 +1,243 @@
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import session from 'express-session';
-import passport from 'passport';
-import { Strategy as TwitterStrategy } from 'passport-twitter';
-import { ethers } from 'ethers';
 import dotenv from 'dotenv';
+import { 
+  getMarkets, 
+  getMarketById, 
+  castVote, 
+  getRecentVotes, 
+  getStats,
+  getLeaderboard,
+  createMarket
+} from './db';
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware
-app.use(helmet());
-app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true }));
-app.use(express.json());
-app.use(session({
-  secret: process.env.SESSION_SECRET || 'moltvote-secret',
-  resave: false,
-  saveUninitialized: false,
-}));
-app.use(passport.initialize());
-app.use(passport.session());
+// ============ 簡易 Rate Limiter ============
+const rateLimit = new Map<string, { count: number; reset: number }>();
+const RATE_LIMIT = 1000; // 每分鐘最多 1000 次
+const RATE_WINDOW = 60000; // 1 分鐘
 
-// 合約設定
-const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
-const wallet = new ethers.Wallet(process.env.PRIVATE_KEY!, provider);
-
-const PRESALE_ABI = [
-  'function verifyUser(address user, string calldata _xHandle) external',
-  'function batchVerifyUsers(address[] calldata users, string[] calldata handles) external',
-  'function startPresale() external',
-  'function finalizePresale() external',
-  'function getPresaleStatus() external view returns (bool, bool, uint256, uint256, uint256, uint256)',
-  'function getUserStatus(address user) external view returns (bool, bool, uint256, string)',
-];
-
-const presaleContract = new ethers.Contract(
-  process.env.PRESALE_ADDRESS!,
-  PRESALE_ABI,
-  wallet
-);
-
-// 儲存待驗證用戶（實際應用用 DB）
-interface PendingUser {
-  address: string;
-  xId: string;
-  xHandle: string;
-  timestamp: number;
+function checkRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const record = rateLimit.get(ip);
+  
+  if (!record || now > record.reset) {
+    rateLimit.set(ip, { count: 1, reset: now + RATE_WINDOW });
+    return true;
+  }
+  
+  if (record.count >= RATE_LIMIT) return false;
+  record.count++;
+  return true;
 }
-const pendingVerifications: Map<string, PendingUser> = new Map();
 
-// Twitter OAuth 設定
-passport.use(new TwitterStrategy({
-    consumerKey: process.env.TWITTER_CONSUMER_KEY!,
-    consumerSecret: process.env.TWITTER_CONSUMER_SECRET!,
-    callbackURL: `${process.env.BACKEND_URL}/auth/twitter/callback`,
-  },
-  (token, tokenSecret, profile, done) => {
-    return done(null, {
-      id: profile.id,
-      username: profile.username,
-      displayName: profile.displayName,
-    });
+// 每 5 分鐘清理過期記錄
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, record] of rateLimit) {
+    if (now > record.reset) rateLimit.delete(ip);
   }
-));
+}, 300000);
 
-passport.serializeUser((user: any, done) => done(null, user));
-passport.deserializeUser((obj: any, done) => done(null, obj));
+// ============ 簡易快取 ============
+interface CacheEntry { data: any; expires: number; }
+const cache = new Map<string, CacheEntry>();
+const CACHE_TTL = 10000; // 10 秒
 
-// ============ API Routes ============
+function getCache(key: string) {
+  const entry = cache.get(key);
+  if (!entry || Date.now() > entry.expires) return null;
+  return entry.data;
+}
 
-// 健康檢查
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: Date.now() });
+function setCache(key: string, data: any, ttl = CACHE_TTL) {
+  cache.set(key, { data, expires: Date.now() + ttl });
+}
+
+// ============ Middleware ============
+app.use(helmet());
+app.use(cors({ origin: '*' }));
+app.use(express.json({ limit: '10kb' })); // 限制 body 大小
+
+// Rate limit 中間件
+app.use((req, res, next) => {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  if (!checkRateLimit(ip)) {
+    return res.status(429).json({ error: 'Too many requests' });
+  }
+  next();
 });
 
-// 開始 Twitter 驗證
-app.get('/auth/twitter', (req, res, next) => {
-  const { wallet: walletAddress } = req.query;
-  if (walletAddress) {
-    (req.session as any).walletAddress = walletAddress;
-  }
-  passport.authenticate('twitter')(req, res, next);
-});
-
-// Twitter 回調
-app.get('/auth/twitter/callback',
-  passport.authenticate('twitter', { failureRedirect: '/' }),
-  async (req, res) => {
-    const user = req.user as any;
-    const walletAddress = (req.session as any).walletAddress;
-    
-    if (!walletAddress || !ethers.isAddress(walletAddress)) {
-      return res.redirect(`${process.env.FRONTEND_URL}?error=invalid_wallet`);
-    }
-    
-    try {
-      // 儲存待驗證資訊
-      pendingVerifications.set(walletAddress.toLowerCase(), {
-        address: walletAddress,
-        xId: user.id,
-        xHandle: user.username,
-        timestamp: Date.now(),
-      });
-      
-      // 呼叫合約驗證用戶
-      console.log(`Verifying user: ${walletAddress} -> @${user.username}`);
-      const tx = await presaleContract.verifyUser(walletAddress, user.username);
-      await tx.wait();
-      console.log(`Verified! TX: ${tx.hash}`);
-      
-      res.redirect(`${process.env.FRONTEND_URL}?verified=true&handle=${user.username}`);
-    } catch (error: any) {
-      console.error('Verification error:', error);
-      res.redirect(`${process.env.FRONTEND_URL}?error=${encodeURIComponent(error.message)}`);
-    }
-  }
-);
-
-// 查詢用戶狀態
-app.get('/api/user/:address', async (req, res) => {
-  try {
-    const { address } = req.params;
-    if (!ethers.isAddress(address)) {
-      return res.status(400).json({ error: 'Invalid address' });
-    }
-    
-    const status = await presaleContract.getUserStatus(address);
-    res.json({
-      verified: status[0],
-      claimed: status[1],
-      order: Number(status[2]),
-      xHandle: status[3],
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 查詢私募狀態
-app.get('/api/presale/status', async (req, res) => {
-  try {
-    const status = await presaleContract.getPresaleStatus();
-    res.json({
-      active: status[0],
-      finalized: status[1],
-      freeClaimed: Number(status[2]),
-      paidClaimed: Number(status[3]),
-      totalRaised: Number(status[4]) / 1e6,
-      timeRemaining: Number(status[5]),
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ============ Admin Routes ============
-
+// Admin 驗證
 const adminAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
-  const adminKey = req.headers['x-admin-key'];
-  if (adminKey !== process.env.ADMIN_KEY) {
+  if (req.headers['x-admin-key'] !== process.env.ADMIN_KEY) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   next();
 };
 
-// 開始私募
-app.post('/api/admin/start-presale', adminAuth, async (req, res) => {
+// ============ API Routes ============
+
+app.get('/health', (_, res) => res.json({ status: 'ok' }));
+
+// AI 投票指南（精簡版）
+app.get('/api/docs', (_, res) => {
+  res.type('text/plain').send(`MoltVote API - AI Voting Guide
+
+GET  /api/markets         → 取得題目列表
+POST /api/markets/:id/vote → 投票
+
+投票格式:
+{
+  "agentId": "你的唯一ID",
+  "agentName": "顯示名稱",
+  "vote": "YES" 或 "NO",
+  "comment": "投票理由(選填)"
+}
+
+範例:
+curl -X POST https://api.moltvote.uk/api/markets/1/vote \\
+  -H "Content-Type: application/json" \\
+  -d '{"agentId":"ai-001","agentName":"MyBot","vote":"YES","comment":"看漲"}'
+
+完整文件: https://moltvote.uk/docs`);
+});
+
+// 市場列表（有快取）
+app.get('/api/markets', (req, res) => {
   try {
-    const tx = await presaleContract.startPresale();
-    await tx.wait();
-    res.json({ success: true, txHash: tx.hash });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    const { category, limit = '50', offset = '0' } = req.query;
+    const cacheKey = `markets:${category || 'all'}:${limit}:${offset}`;
+    
+    let data = getCache(cacheKey);
+    if (!data) {
+      data = getMarkets({
+        category: category as string,
+        limit: Math.min(parseInt(limit as string), 100), // 最多 100
+        offset: parseInt(offset as string),
+      });
+      setCache(cacheKey, data);
+    }
+    res.json(data);
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
   }
 });
 
-// 結束私募
-app.post('/api/admin/finalize-presale', adminAuth, async (req, res) => {
+// 單一市場（有快取）
+app.get('/api/markets/:id', (req, res) => {
   try {
-    const tx = await presaleContract.finalizePresale();
-    await tx.wait();
-    res.json({ success: true, txHash: tx.hash });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 手動驗證用戶
-app.post('/api/admin/verify-user', adminAuth, async (req, res) => {
-  try {
-    const { address, xHandle } = req.body;
-    if (!ethers.isAddress(address)) {
-      return res.status(400).json({ error: 'Invalid address' });
+    const id = parseInt(req.params.id);
+    const cacheKey = `market:${id}`;
+    
+    let data = getCache(cacheKey);
+    if (!data) {
+      data = getMarketById(id);
+      if (data) setCache(cacheKey, data, 5000); // 5秒快取
     }
     
-    const tx = await presaleContract.verifyUser(address, xHandle);
-    await tx.wait();
-    res.json({ success: true, txHash: tx.hash });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: 'Not found' });
+    res.json(data);
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
   }
 });
 
-// 批量驗證
-app.post('/api/admin/batch-verify', adminAuth, async (req, res) => {
+// 投票（清除相關快取）
+app.post('/api/markets/:id/vote', (req, res) => {
   try {
-    const { users } = req.body; // [{ address, xHandle }, ...]
-    const addresses = users.map((u: any) => u.address);
-    const handles = users.map((u: any) => u.xHandle);
+    const { agentId, agentName, vote, comment } = req.body;
     
-    const tx = await presaleContract.batchVerifyUsers(addresses, handles);
-    await tx.wait();
-    res.json({ success: true, txHash: tx.hash, count: users.length });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (!agentId || !agentName || !['YES', 'NO'].includes(vote)) {
+      return res.status(400).json({ error: 'Invalid request' });
+    }
+    
+    const marketId = parseInt(req.params.id);
+    const result = castVote({ marketId, agentId, agentName, vote, comment });
+    
+    // 清除相關快取
+    cache.delete(`market:${marketId}`);
+    for (const key of cache.keys()) {
+      if (key.startsWith('markets:') || key.startsWith('votes:') || key.startsWith('stats')) {
+        cache.delete(key);
+      }
+    }
+    
+    res.json(result);
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
   }
 });
 
-// 統計數據
-app.get('/api/admin/stats', adminAuth, async (req, res) => {
+// 最近投票（有快取）
+app.get('/api/votes/recent', (req, res) => {
   try {
-    const status = await presaleContract.getPresaleStatus();
-    const pendingCount = pendingVerifications.size;
+    const limit = Math.min(parseInt(req.query.limit as string) || 20, 50);
+    const cacheKey = `votes:${limit}`;
     
-    res.json({
-      presale: {
-        active: status[0],
-        finalized: status[1],
-        freeClaimed: Number(status[2]),
-        paidClaimed: Number(status[3]),
-        totalRaised: Number(status[4]) / 1e6,
-        timeRemaining: Number(status[5]),
-      },
-      pending: pendingCount,
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    let data = getCache(cacheKey);
+    if (!data) {
+      data = getRecentVotes(limit);
+      setCache(cacheKey, data);
+    }
+    res.json(data);
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
   }
 });
 
-// 啟動伺服器
+// 統計（快取 30 秒）
+app.get('/api/stats', (_, res) => {
+  try {
+    let data = getCache('stats');
+    if (!data) {
+      data = getStats();
+      setCache('stats', data, 30000);
+    }
+    res.json(data);
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 排行榜（快取 30 秒）
+app.get('/api/leaderboard', (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
+    const cacheKey = `leaderboard:${limit}`;
+    
+    let data = getCache(cacheKey);
+    if (!data) {
+      data = getLeaderboard(limit);
+      setCache(cacheKey, data, 30000);
+    }
+    res.json(data);
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============ Admin Routes ============
+app.post('/api/admin/markets', adminAuth, (req, res) => {
+  try {
+    const { question, category, endDate, isHot } = req.body;
+    if (!question || !category || !endDate) {
+      return res.status(400).json({ error: 'Missing fields' });
+    }
+    const result = createMarket({ question, category, endDate, isHot });
+    cache.clear(); // 清除所有快取
+    res.json({ success: true, id: result.lastInsertRowid });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============ 啟動 ============
 app.listen(PORT, () => {
-  console.log(`🚀 MoltVote Backend running on port ${PORT}`);
-  console.log(`   Presale Contract: ${process.env.PRESALE_ADDRESS}`);
+  console.log(`🚀 MoltVote API running on port ${PORT}`);
 });
